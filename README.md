@@ -1,6 +1,8 @@
 # Tracing distinguishability through transformer processing with stochastic LayerNorm
 [arxiv link](https://arxiv.org/abs/)
 
+![Figure showing the read-write computation flow of a general transformer, with residual stream reads passing through a bottleneck.](/img/schematic.png)
+
 This repository contains training and analysis code for treating each LayerNorm read in a transformer as a rate-limited channel. Each read is modeled as a von Mises--Fisher (vMF) random variable on the sphere induced by LayerNorm. The concentration parameter `kappa` controls the read precision, and the network is trained under a fixed total rate budget shared across all taps, learning how to allocate that budget across the model.
 
 The accompanying analysis measures how distinguishability between inputs propagates through these noisy reads, including through the Q, K, and V projections of individual attention heads.
