@@ -3,7 +3,7 @@
 
 <img src=/img/schematic.png width=30%>
 
-This repository contains training and analysis code for treating each LayerNorm read in a transformer as a rate-limited channel. Each read is modeled as a von Mises--Fisher (vMF) random variable on the sphere induced by LayerNorm. The concentration parameter `kappa` controls the read precision, and the network is trained under a fixed total rate budget shared across all taps, learning how to allocate that budget across the model.
+This repository contains training and analysis code for treating each LayerNorm read in a transformer as a rate-limited channel. Each read is modeled as a von Mises-Fisher (vMF) random variable on the sphere induced by LayerNorm.  The concentration parameter `kappa` controls the read precision, and the network is trained under a fixed total rate budget shared across all taps, learning how to allocate that budget across the model.
 
 The accompanying analysis measures how distinguishability between inputs propagates through these noisy reads, including through the Q, K, and V projections of individual attention heads.
 
@@ -94,8 +94,6 @@ python random_projection_baseline.py --ckpt runs/gpt2_sigma1/ckpt.pt
 The `--ckpt` defaults in the driver scripts refer to local paths used for the original experiments. Pass an explicit checkpoint path for other runs.
 
 ## Caveats
-
-* **Q/K/V analyses include upstream noise.** The probes estimate CRN-conditioned posterior means under the actual stochastic forward process rather than substituting a clean deterministic forward pass. The clean-pass version is not equivalent and can give substantially different results.
 
 * **Per-head retention should be compared with the random-projection baseline.** A random read with the same output dimensionality can preserve a substantial fraction of the apparent distinguishability. `random_projection_baseline.py` is included to quantify this effect.
 
