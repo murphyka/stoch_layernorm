@@ -202,6 +202,10 @@ def main():
     ap.add_argument("--rrc_scale_min", type=float, default=0.4,
                     help="RandomResizedCrop lower scale bound (finetune 0.4; scratch recipe 0.08)")
     ap.add_argument("--re_prob", type=float, default=0.0, help="random-erasing prob (finetune default 0)")
+    ap.add_argument("--kappa_lo", type=float, default=0.5,
+                    help="floor of the vMF rate/sigma table (vmf_utils.build_rate_sigma_maps). 0.5 puts the "
+                         "floor at kappa_lo^2/(2p) nats/tap (6.5e-4 for ViT-tiny, 3.3e-4 for ViT-S). Runs "
+                         "before 2026-09-13 used 5.0 (0.065 / 0.033 nats); pass 5.0 to reproduce them.")
     ap.add_argument("--clean", action="store_true", help="train a clean teacher (channel OFF, CE)")
     ap.add_argument("--distill", action="store_true", help="loss = KL from a frozen teacher")
     ap.add_argument("--teacher", default="", help="teacher ckpt (required with --distill)")
@@ -245,7 +249,7 @@ def main():
     # sigma_g is the dimension-independent noise knob; the resulting rate/budget scales with D.
     D = model.embed_dim
     p = D - 1
-    maps = vmf_utils.build_rate_sigma_maps(p)
+    maps = vmf_utils.build_rate_sigma_maps(p, kappa_lo=args.kappa_lo)
     kappa_g = float(np.interp(args.sigma_g, maps["sigma"][::-1], maps["kappa"][::-1]))
     rate_g = float(vmf_utils.rate_kl(kappa_g, p))
     B = n_taps * rate_g
@@ -258,7 +262,8 @@ def main():
     print(f"[setup] model={args.model} D={D} arm={args.arm} sigma_g={args.sigma_g} kappa_g={kappa_g:.1f} "
           f"rate/tap={rate_g:.2f} nats ({rate_g/math.log(2):.0f} bits) "
           f"B={B:.1f} nats ({B/math.log(2):.0f} bits total) "
-          f"classes={num_classes} taps={n_taps} amp={amp_dtype}", flush=True)
+          f"classes={num_classes} taps={n_taps} amp={amp_dtype} "
+          f"kappa_lo={args.kappa_lo} (floor sigma={maps['sigma'][0]:.0f}, rate={maps['rate'][0]:.1e} nats)", flush=True)
 
     # persist fixed probe-set indices for reproducible post-hoc activations
     g = torch.Generator().manual_seed(12345)
@@ -353,6 +358,11 @@ def main():
     ckpt_path = os.path.join(args.out, "ckpt_last.pt")
     if os.path.exists(ckpt_path) and not args.no_resume:
         ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt_klo = float(ckpt["policy"]["kappa_grid"][0])
+        if not math.isclose(ckpt_klo, args.kappa_lo, rel_tol=1e-4):
+            raise SystemExit(f"[resume] {ckpt_path} was built with a rate/sigma table floored at "
+                             f"kappa_lo={ckpt_klo:.6g} but this run has --kappa_lo {args.kappa_lo}. "
+                             f"Pass --kappa_lo {ckpt_klo:.6g} to continue it, or use a new --out / --no_resume.")
         model.load_state_dict(ckpt["model"])
         policy.load_state_dict(ckpt["policy"])
         if ckpt.get("optimizer") is not None:
