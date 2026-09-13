@@ -110,7 +110,11 @@ def lr_at(step, total_steps, warmup_steps, base_lr, min_lr):
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * prog))
 
 def safe_kappa_lo(p, floor=1e-250):
-    """vmf_utils.build_rate_sigma_maps defaults kappa_lo=5, which is safe at the ViT
+    """LEGACY (the default is now --kappa_lo 0.5, made possible by vmf_utils.log_iv). Kept because
+    runs before 2026-09-13 were built with it and analysis scripts use it to flag at-floor taps
+    on those checkpoints. For newer checkpoints read the floor from policy["kappa_grid"][0].
+
+    vmf_utils.build_rate_sigma_maps used to default to kappa_lo=5, safe at the ViT
     widths used here (p=383). GPT-2's LN width is p=767: the Bessel order nu=p/2-1 is
     twice as big, so ive(nu, 5) underflows to a hard 0.0 (not just small) and rho
     becomes 0/0. Search for the smallest kappa where ive(nu, kappa) clears a safety
@@ -281,7 +285,13 @@ def build_lm_loaders(data_name, data_config, model_name, block_size, batch_size,
     return train_ld, val_ld, tok.vocab_size, len(proc["validation"])
 
 
-def build_model(controller, pretrained, model_name, dropout_overrides=None):
+def build_model(controller, pretrained, model_name, dropout_overrides=None, deterministic_ln_f=False):
+    """Wraps every nn.LayerNorm as a NoisyLayerNorm tap. Tap order is the parent-first
+    named_modules sweep, so ln_f (a child of `transformer`) is idx 0 and h.i.ln_1/ln_2
+    follow. deterministic_ln_f=True leaves ln_f as a plain nn.LayerNorm: it is not a tap,
+    gets no noise and no share of the rate budget, and the remaining taps are 0..n-1 in
+    h.0.ln_1, h.0.ln_2, ... order (i.e. shifted down by one vs the default). Parameter
+    names are unchanged either way (weight/bias), so state_dicts stay interchangeable."""
     dropout_overrides = dropout_overrides or {}
     if pretrained:
         model = GPT2LMHeadModel.from_pretrained(model_name, **dropout_overrides)
@@ -291,6 +301,8 @@ def build_model(controller, pretrained, model_name, dropout_overrides=None):
     for name, module in model.named_modules():
         for cn, child in list(module.named_children()):
             if isinstance(child, nn.LayerNorm):
+                if deterministic_ln_f and f"{name}.{cn}" == "transformer.ln_f":
+                    continue
                 setattr(module, cn, NoisyLayerNorm(child, controller, idx))
                 idx += 1
     return model, idx
@@ -385,6 +397,16 @@ def main():
                          "disables it); set to 0.0 for a dropout-free run if that confound matters.")
     ap.add_argument("--embd_pdrop", type=float, default=None, help="override GPT2Config embd_pdrop")
     ap.add_argument("--attn_pdrop", type=float, default=None, help="override GPT2Config attn_pdrop")
+    ap.add_argument("--kappa_lo", type=float, default=0.5,
+                    help="floor of the vMF rate/sigma table (vmf_utils.build_rate_sigma_maps). 0.5 puts the "
+                         "floor at ~1.6e-4 nats/tap (sigma ~1500) for gpt2-small. Runs before 2026-09-13 used "
+                         "safe_kappa_lo(p) = 76.3 for gpt2-small (floor 3.74 nats, sigma 10.1); pass that "
+                         "value to reproduce them.")
+    ap.add_argument("--deterministic_ln_f", action="store_true",
+                    help="leave the final readout LayerNorm (ln_f) deterministic: not a noise tap, "
+                         "excluded from the rate budget (B = n_stochastic_taps * rate(sigma_g), so "
+                         "sigma_g keeps its per-tap uniform-equivalent meaning). Default: ln_f is "
+                         "stochastic and shares the budget like every other tap.")
     ap.add_argument("--clean", action="store_true", help="train a clean teacher (channel OFF, CE)")
     ap.add_argument("--distill", action="store_true", help="loss = KL from a frozen teacher")
     ap.add_argument("--teacher", default="",
@@ -426,13 +448,14 @@ def main():
         "resid_pdrop": args.resid_pdrop, "embd_pdrop": args.embd_pdrop, "attn_pdrop": args.attn_pdrop,
     }.items() if v is not None}
     model, n_taps = build_model(controller, pretrained=(args.arm == "finetune"),
-                                model_name=args.model_name, dropout_overrides=dropout_overrides)
+                                model_name=args.model_name, dropout_overrides=dropout_overrides,
+                                deterministic_ln_f=args.deterministic_ln_f)
     assert args.block_size <= model.config.n_positions, \
         f"--block_size {args.block_size} exceeds {args.model_name}'s n_positions={model.config.n_positions}"
     model.to(device)
     D = model.config.n_embd
     p = D - 1
-    maps = vmf_utils.build_rate_sigma_maps(p, kappa_lo=safe_kappa_lo(p))
+    maps = vmf_utils.build_rate_sigma_maps(p, kappa_lo=args.kappa_lo)
     kappa_g = float(np.interp(args.sigma_g, maps["sigma"][::-1], maps["kappa"][::-1]))
     rate_g = float(vmf_utils.rate_kl(kappa_g, p))
     B = n_taps * rate_g
@@ -446,6 +469,8 @@ def main():
     print(f"[setup] model={args.model_name} arm={args.arm} D={D} p={p} sigma_g={args.sigma_g} "
           f"kappa_g={kappa_g:.1f} rate/tap={rate_g:.2f} nats ({rate_g/math.log(2):.0f} bits) "
           f"B={B:.1f} nats ({B/math.log(2):.0f} bits total) vocab={vocab_size} taps={n_taps} "
+          f"ln_f={'deterministic' if args.deterministic_ln_f else 'stochastic'} "
+          f"kappa_lo={args.kappa_lo} (floor sigma={maps['sigma'][0]:.0f}, rate={maps['rate'][0]:.1e} nats) "
           f"amp={amp_dtype} pdrop(resid/embd/attn)="
           f"{model.config.resid_pdrop}/{model.config.embd_pdrop}/{model.config.attn_pdrop}", flush=True)
 
@@ -504,6 +529,16 @@ def main():
     ckpt_path = os.path.join(args.out, "ckpt_last.pt")
     if os.path.exists(ckpt_path) and not args.no_resume:
         ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt_det = ckpt["args"].get("deterministic_ln_f", False)
+        if ckpt_det != args.deterministic_ln_f:
+            raise SystemExit(f"[resume] {ckpt_path} was trained with deterministic_ln_f={ckpt_det} "
+                             f"but this run has {args.deterministic_ln_f}: tap count/indexing and "
+                             f"the rate budget differ. Use a different --out or --no_resume.")
+        ckpt_klo = float(ckpt["policy"]["kappa_grid"][0])
+        if not math.isclose(ckpt_klo, args.kappa_lo, rel_tol=1e-4):
+            raise SystemExit(f"[resume] {ckpt_path} was built with a rate/sigma table floored at "
+                             f"kappa_lo={ckpt_klo:.6g} but this run has --kappa_lo {args.kappa_lo}. "
+                             f"Pass --kappa_lo {ckpt_klo:.6g} to continue it, or use a new --out / --no_resume.")
         model.load_state_dict(ckpt["model"])
         policy.load_state_dict(ckpt["policy"])
         opt.load_state_dict(ckpt["optimizer"])
